@@ -51,6 +51,12 @@ type Consumer struct {
 
 	isClosed  uint32
 	isClosing uint32
+
+	// closeTimeoutMs is the maximum time in milliseconds that Close() will
+	// wait for the consumer group to cleanly leave before force-destroying
+	// the handle. Zero means no timeout (the default, preserving existing
+	// behaviour). Configured via "go.consumer.close.timeout.ms".
+	closeTimeoutMs int
 }
 
 // IsClosed returns boolean representing if client is closed or not
@@ -528,6 +534,12 @@ func (c *Consumer) ReadMessage(timeout time.Duration) (*Message, error) {
 
 // Close Consumer instance.
 // The object is no longer usable after this call.
+//
+// If go.consumer.close.timeout.ms was configured with a positive value and the
+// consumer group has not finished closing within that period, Close() calls
+// rd_kafka_destroy_flags with RD_KAFKA_DESTROY_F_NO_CONSUMER_CLOSE to
+// force-destroy the handle without waiting for broker acknowledgement. By
+// default (0) Close() waits indefinitely, preserving the original behaviour.
 func (c *Consumer) Close() (err error) {
 	// Check if the client is already closed.
 	err = c.verifyClient()
@@ -549,8 +561,12 @@ func (c *Consumer) Close() (err error) {
 
 	C.rd_kafka_consumer_close_queue(c.handle.rk, c.handle.rkq)
 
-	for C.rd_kafka_consumer_closed(c.handle.rk) != 1 {
-		c.Poll(100)
+	if c.closeTimeoutMs > 0 {
+		c.drainCloseWithTimeout(c.closeTimeoutMs)
+	} else {
+		for C.rd_kafka_consumer_closed(c.handle.rk) != 1 {
+			c.Poll(100)
+		}
 	}
 
 	// After this point, no more consumer methods may be called.
@@ -562,9 +578,28 @@ func (c *Consumer) Close() (err error) {
 
 	c.handle.cleanup()
 
-	C.rd_kafka_destroy(c.handle.rk)
+	if c.closeTimeoutMs > 0 && C.rd_kafka_consumer_closed(c.handle.rk) != 1 {
+		// Timed out waiting for broker acknowledgement of leave-group.
+		// Force-destroy the handle to free all C-heap resources without
+		// waiting for the broker.
+		C.rd_kafka_destroy_flags(c.handle.rk, C.RD_KAFKA_DESTROY_F_NO_CONSUMER_CLOSE)
+	} else {
+		C.rd_kafka_destroy(c.handle.rk)
+	}
 
 	return nil
+}
+
+// drainCloseWithTimeout polls until the consumer group has cleanly closed or
+// the timeout (in milliseconds) expires. It does not block indefinitely.
+func (c *Consumer) drainCloseWithTimeout(timeoutMs int) {
+	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+	for C.rd_kafka_consumer_closed(c.handle.rk) != 1 {
+		if time.Now().After(deadline) {
+			return
+		}
+		c.Poll(100)
+	}
 }
 
 // NewConsumer creates a new high-level Consumer instance.
@@ -627,6 +662,12 @@ func NewConsumer(conf *ConfigMap) (*Consumer, error) {
 		return nil, err
 	}
 	eventsChanSize := v.(int)
+
+	v, err = confCopy.extract("go.consumer.close.timeout.ms", 0)
+	if err != nil {
+		return nil, err
+	}
+	c.closeTimeoutMs = v.(int)
 
 	logsChanEnable, logsChan, err := confCopy.extractLogConfig()
 	if err != nil {
